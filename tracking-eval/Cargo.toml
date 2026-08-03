@@ -1,0 +1,18 @@
+[package]
+name = "tracking-eval"
+description = "Synthetic-data evaluation harness for tracking-core: generates known-ground-truth frame sequences and scores the tracker against them."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "eval"
+path = "src/main.rs"
+
+[lib]
+name = "tracking_eval"
+path = "src/lib.rs"
+
+[dependencies]
+tracking-core = { path = "../tracking-core" }
