@@ -38,17 +38,24 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
 
-      - name: install libclang + OpenCV (+ contrib) dev packages
+      - name: install libclang-18 + OpenCV (+ contrib) dev packages
         run: |
           sudo apt-get update
-          sudo apt-get install -y libclang-dev libopencv-dev
+          # Pinned to the -18 package explicitly (not the unversioned
+          # libclang-dev meta-package): a floating version pull was observed
+          # to produce a libclang.so whose exported symbols didn't match
+          # what the `clang`/`clang-sys` crates were compiled against
+          # (rust-lld "undefined symbol: clang_EvalResult_getAsStr" and
+          # friends) even though the same package family works locally.
+          sudo apt-get install -y libclang-18-dev libopencv-dev
 
       - name: locate libclang.so (Ubuntu ships it as libclang-N.so, not libclang.so)
         run: |
           set -euo pipefail
-          libclang_dir="$(dirname "$(find /usr/lib -iname 'libclang-*.so*' | sort -V | tail -1)")"
+          real="$(find /usr/lib -iname 'libclang-18.so*' | sort -V | tail -1)"
+          test -n "$real"
           mkdir -p "$HOME/.local/libclang-shim"
-          ln -sf "$(find "$libclang_dir" -iname 'libclang-*.so*' | sort -V | tail -1)" "$HOME/.local/libclang-shim/libclang.so"
+          ln -sf "$real" "$HOME/.local/libclang-shim/libclang.so"
           echo "LIBCLANG_PATH=$HOME/.local/libclang-shim" >> "$GITHUB_ENV"
 
       - name: clippy
