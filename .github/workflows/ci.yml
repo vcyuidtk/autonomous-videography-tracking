@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    name: tracking-core + tracking-eval (no system deps)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: fmt
+        run: cargo fmt --all --check
+
+      - name: clippy
+        run: cargo clippy -p tracking-core -p tracking-eval --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test -p tracking-core -p tracking-eval
+
+      - name: eval harness
+        run: cargo run -p tracking-eval --bin eval
+
+  cv:
+    name: tracking-cv (real OpenCV CSRT)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install libclang + OpenCV (+ contrib) dev packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libclang-dev libopencv-dev
+
+      - name: locate libclang.so (Ubuntu ships it as libclang-N.so, not libclang.so)
+        run: |
+          set -euo pipefail
+          libclang_dir="$(dirname "$(find /usr/lib -iname 'libclang-*.so*' | sort -V | tail -1)")"
+          mkdir -p "$HOME/.local/libclang-shim"
+          ln -sf "$(find "$libclang_dir" -iname 'libclang-*.so*' | sort -V | tail -1)" "$HOME/.local/libclang-shim/libclang.so"
+          echo "LIBCLANG_PATH=$HOME/.local/libclang-shim" >> "$GITHUB_ENV"
+
+      - name: clippy
+        run: cargo clippy -p tracking-cv --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test -p tracking-cv
