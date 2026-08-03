@@ -1,0 +1,16 @@
+[package]
+name = "tracking-cv"
+description = "Real correlation-filter Tracker backend (OpenCV CSRT) for tracking-core."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+tracking-core = { path = "../tracking-core" }
+# PINNED — "video" and "tracking" (contrib) features are both required; the
+# init/update methods actually called live in "video", the TrackerCSRT type
+# itself in "tracking" (contrib) — either alone fails with a confusing
+# trait-not-in-scope error rather than a missing-type one. See README
+# "Provenance" for where this pin was validated.
+opencv = { version = "=0.94.4", default-features = false, features = ["video", "tracking", "imgproc"] }
