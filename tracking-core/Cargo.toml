@@ -1,0 +1,12 @@
+[package]
+name = "tracking-core"
+description = "Single-target visual-tracking algorithm core: acquisition, association, lock/loss state machine. No I/O, no vendor CV SDK, no IPC."
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+thiserror = "2.0.19"
+
+[dev-dependencies]
