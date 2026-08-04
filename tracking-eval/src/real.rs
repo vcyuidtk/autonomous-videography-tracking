@@ -44,7 +44,22 @@
 //!
 //! A frame with no `track_id 0` row is treated as "target not visible this
 //! tick" (occluded/out of frame) — same meaning as `synthetic::GroundTruth`'s
-//! `visible: false`.
+//! `visible: false`. A ground-truth file with *no* `track_id 0` rows at all
+//! (target never visible on any frame) is rejected outright (see
+//! [`RealSeqError::TargetNeverVisible`]) rather than silently scored — an
+//! empty target track makes `metrics::score`'s `success_rate()` vacuously
+//! report 100%, which would be a silent false pass on exactly the class of
+//! mistake (wrong file, wrong track id) this harness exists to catch.
+//!
+//! A duplicate row for the same `(frame, track_id)` is last-write-wins, no
+//! error — the file is trusted to be a clean annotation export, and
+//! rejecting duplicates outright would make hand-edited test fixtures
+//! (like this crate's own `assets/sample/ground_truth.csv`) more fragile
+//! than useful.
+//!
+//! **`ffmpeg` invocation has no timeout.** A wedged or slow decode blocks
+//! `extract_video_frames` indefinitely; if you're driving this from CI, wrap
+//! the call (or the `eval real --video` invocation) in an external timeout.
 //!
 //! ## Detections: ground truth as a stand-in "perfect detector"
 //!
@@ -59,9 +74,10 @@
 //! lock-loss state machine from detector quality) — it is not an end-to-end
 //! detector+tracker evaluation. Wiring in a real detector's (e.g.
 //! `autonomous-videography-perception`'s) output instead of ground truth
-//! would need only a different `Vec<Option<Vec<Detection>>>` fed into
-//! [`RealSequence::into_tracking_sequence`]'s caller — the frame-loading and
-//! scoring code is agnostic to where detections came from.
+//! would need only building a different `Vec<Option<Vec<Detection>>>` and
+//! constructing a [`Sequence`] with it directly (see [`build_sequence`]) —
+//! the frame-loading and scoring code is agnostic to where detections came
+//! from.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -93,6 +109,8 @@ pub enum RealSeqError {
     UnsupportedTrackId(u64),
     #[error("ground truth references frame {frame}, but the sequence only has {num_frames} frames")]
     FrameOutOfRange { frame: usize, num_frames: usize },
+    #[error("ground truth has no track_id 0 (target) rows on any frame — nothing to track/score; check the file and --gt path")]
+    TargetNeverVisible,
     #[error("`ffmpeg` failed to decode {video:?}: {stderr}")]
     FfmpegFailed { video: PathBuf, stderr: String },
     #[error("failed to launch `ffmpeg` (is it installed and on PATH?): {0}")]
@@ -100,10 +118,15 @@ pub enum RealSeqError {
 }
 
 /// Decode `video_path` to a numbered PNG sequence in `out_dir` via the
-/// system `ffmpeg` binary. `out_dir` is created if it doesn't exist.
+/// system `ffmpeg` binary. `out_dir` is wiped first if it already exists —
+/// re-running extraction into a dir left over from a *different*, longer
+/// video would otherwise leave that video's trailing frames in place
+/// (`ffmpeg -y` only overwrites the filenames it writes this run), silently
+/// misaligning frame content against the ground-truth CSV's indices.
 /// Frames come out as `frame_000001.png`, `frame_000002.png`, ... — in
 /// source order, which is what [`load_image_sequence`] expects.
 pub fn extract_video_frames(video_path: &Path, out_dir: &Path) -> Result<(), RealSeqError> {
+    fs::remove_dir_all(out_dir).ok();
     fs::create_dir_all(out_dir).map_err(|e| RealSeqError::Io {
         path: out_dir.to_path_buf(),
         source: e,
@@ -135,9 +158,11 @@ pub fn load_image_sequence(dir: &Path) -> Result<(Vec<Vec<u8>>, u32, u32), RealS
         })?
         .filter_map(|entry| entry.ok().map(|e| e.path()))
         .filter(|p| {
+            // Keep in sync with the `image` crate features enabled in
+            // Cargo.toml — only advertise formats we actually decode.
             p.extension()
                 .and_then(|e| e.to_str())
-                .map(|e| matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg" | "bmp"))
+                .map(|e| matches!(e.to_ascii_lowercase().as_str(), "png" | "jpg" | "jpeg"))
                 .unwrap_or(false)
         })
         .collect();
@@ -182,10 +207,19 @@ struct GtRow {
     bbox: BBox,
 }
 
+/// Coordinate magnitude bound for ground-truth boxes. Generous for any real
+/// frame resolution, but tight enough that `BBox::width()`/`height()`/
+/// `area()` (plain `i64` arithmetic, no overflow checks in a release build,
+/// a debug-build panic in a dev build) can never overflow on a validated
+/// row: two values each within `±COORD_BOUND` can't overflow an `i64`
+/// subtraction or the `width * height` multiplication used by `area()`.
+const COORD_BOUND: i64 = 1_000_000;
+
 fn parse_ground_truth(text: &str) -> Result<Vec<GtRow>, RealSeqError> {
     const NUM_FIELDS: usize = 6; // frame,track_id,x1,y1,x2,y2
 
     let mut rows = Vec::new();
+    let mut seen_data_row = false;
     for (idx, raw_line) in text.lines().enumerate() {
         let line_no = idx + 1;
         let line = raw_line.trim();
@@ -194,11 +228,22 @@ fn parse_ground_truth(text: &str) -> Result<Vec<GtRow>, RealSeqError> {
         }
         let fields: Vec<&str> = line.split(',').map(str::trim).collect();
 
-        // Tolerate a header row (first field not an integer) rather than
-        // erroring on it outright.
+        // Tolerate a header row (first field not an integer) — but only
+        // before any real data row has been seen. A malformed *data* row
+        // later in the file (typo, corrupt export, stray negative/decimal)
+        // must not be silently swallowed as "just another header"; that's
+        // silent ground-truth data loss in an annotation-driven eval tool.
         if fields[0].parse::<usize>().is_err() {
-            continue;
+            if !seen_data_row {
+                continue;
+            }
+            return Err(RealSeqError::BadGroundTruthLine {
+                line_no,
+                raw: line.to_string(),
+                reason: format!("field 0 (frame) not a non-negative integer: {:?}", fields[0]),
+            });
         }
+        seen_data_row = true;
 
         if fields.len() != NUM_FIELDS {
             return Err(RealSeqError::BadGroundTruthLine {
@@ -211,20 +256,46 @@ fn parse_ground_truth(text: &str) -> Result<Vec<GtRow>, RealSeqError> {
             });
         }
 
-        let parse_i64 = |i: usize, name: &str| -> Result<i64, RealSeqError> {
-            fields[i].parse::<i64>().map_err(|e| RealSeqError::BadGroundTruthLine {
+        // frame/track_id parse straight into their real (unsigned) types —
+        // no i64-then-cast, so a negative value is a normal parse error
+        // instead of silently wrapping to a huge, confusing number.
+        let frame: usize = fields[0].parse().map_err(|e| RealSeqError::BadGroundTruthLine {
+            line_no,
+            raw: line.to_string(),
+            reason: format!("field 0 (frame) not a non-negative integer: {e}"),
+        })?;
+        let track_id: u64 = fields[1].parse().map_err(|e| RealSeqError::BadGroundTruthLine {
+            line_no,
+            raw: line.to_string(),
+            reason: format!("field 1 (track_id) not a non-negative integer: {e}"),
+        })?;
+
+        let parse_coord = |i: usize, name: &str| -> Result<i64, RealSeqError> {
+            let v: i64 = fields[i].parse().map_err(|e| RealSeqError::BadGroundTruthLine {
                 line_no,
                 raw: line.to_string(),
                 reason: format!("field {i} ({name}) not an integer: {e}"),
-            })
+            })?;
+            if !(-COORD_BOUND..=COORD_BOUND).contains(&v) {
+                return Err(RealSeqError::BadGroundTruthLine {
+                    line_no,
+                    raw: line.to_string(),
+                    reason: format!("field {i} ({name}) = {v} is outside the sane range +/-{COORD_BOUND}"),
+                });
+            }
+            Ok(v)
         };
-
-        let frame = parse_i64(0, "frame")? as usize;
-        let track_id = parse_i64(1, "track_id")? as u64;
-        let x1 = parse_i64(2, "x1")?;
-        let y1 = parse_i64(3, "y1")?;
-        let x2 = parse_i64(4, "x2")?;
-        let y2 = parse_i64(5, "y2")?;
+        let x1 = parse_coord(2, "x1")?;
+        let y1 = parse_coord(3, "y1")?;
+        let x2 = parse_coord(4, "x2")?;
+        let y2 = parse_coord(5, "y2")?;
+        if x1 >= x2 || y1 >= y2 {
+            return Err(RealSeqError::BadGroundTruthLine {
+                line_no,
+                raw: line.to_string(),
+                reason: format!("box ({x1},{y1},{x2},{y2}) is degenerate or reversed — need x1<x2 and y1<y2"),
+            });
+        }
 
         rows.push(GtRow {
             frame,
@@ -243,6 +314,7 @@ pub fn build_sequence(name: &'static str, frames: Vec<Vec<u8>>, width: u32, heig
 
     let mut target: Vec<Option<BBox>> = vec![None; num_frames];
     let mut distractor: Vec<Option<BBox>> = vec![None; num_frames];
+    let mut any_target = false;
     for row in rows {
         if row.frame >= num_frames {
             return Err(RealSeqError::FrameOutOfRange {
@@ -251,10 +323,20 @@ pub fn build_sequence(name: &'static str, frames: Vec<Vec<u8>>, width: u32, heig
             });
         }
         match row.track_id {
-            0 => target[row.frame] = Some(row.bbox),
+            0 => {
+                target[row.frame] = Some(row.bbox);
+                any_target = true;
+            }
             1 => distractor[row.frame] = Some(row.bbox),
             other => return Err(RealSeqError::UnsupportedTrackId(other)),
         }
+    }
+    // A target that's never visible makes `Report::success_rate()` return a
+    // vacuous 1.0 (see metrics.rs) — a silent false pass, not a real score.
+    // Almost certainly the wrong file or the wrong --gt path; reject it
+    // rather than let it flow through and print a clean "100%".
+    if !any_target {
+        return Err(RealSeqError::TargetNeverVisible);
     }
 
     let mut target_gt = Vec::with_capacity(num_frames);
@@ -350,6 +432,47 @@ mod tests {
     }
 
     #[test]
+    fn parse_ground_truth_only_tolerates_header_before_first_data_row() {
+        // A malformed frame field on a *later* line (typo, corrupt export)
+        // must error, not be silently treated as "just another header" and
+        // dropped — that would be silent ground-truth data loss.
+        let csv = "frame,track_id,x1,y1,x2,y2\n0,0,1,2,3,4\nnot_a_frame,0,1,2,3,4\n";
+        let err = parse_ground_truth(csv).unwrap_err();
+        match err {
+            RealSeqError::BadGroundTruthLine { line_no, .. } => assert_eq!(line_no, 3),
+            other => panic!("expected BadGroundTruthLine, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_ground_truth_rejects_negative_track_id_cleanly() {
+        // Must be a normal parse error, not a wraparound to a huge u64.
+        let csv = "0,-1,1,2,3,4\n";
+        let err = parse_ground_truth(csv).unwrap_err();
+        assert!(matches!(err, RealSeqError::BadGroundTruthLine { .. }));
+    }
+
+    #[test]
+    fn parse_ground_truth_rejects_degenerate_and_reversed_boxes() {
+        for csv in ["0,0,10,10,10,20\n", "0,0,10,10,20,10\n", "0,0,20,10,10,20\n"] {
+            let err = parse_ground_truth(csv).unwrap_err();
+            assert!(
+                matches!(err, RealSeqError::BadGroundTruthLine { .. }),
+                "csv {csv:?} should have been rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_ground_truth_rejects_out_of_bound_coordinates_instead_of_overflowing() {
+        // Would otherwise reach BBox::width()/height()/area() (plain i64
+        // arithmetic) and panic on overflow in a debug build.
+        let csv = format!("0,0,{},0,{},1\n", i64::MIN, i64::MAX);
+        let err = parse_ground_truth(&csv).unwrap_err();
+        assert!(matches!(err, RealSeqError::BadGroundTruthLine { .. }));
+    }
+
+    #[test]
     fn build_sequence_marks_missing_frames_not_visible() {
         // 3 tiny 2x2 frames, target present on frames 0 and 2 only.
         let frames = vec![vec![0u8; 2 * 2 * 3]; 3];
@@ -378,6 +501,35 @@ mod tests {
         let gt = "5,0,0,0,1,1\n";
         let err = build_sequence("t", frames, 2, 2, gt).unwrap_err();
         assert!(matches!(err, RealSeqError::FrameOutOfRange { frame: 5, num_frames: 1 }));
+    }
+
+    #[test]
+    fn build_sequence_rejects_ground_truth_with_no_target_rows() {
+        // Distractor-only ground truth (or an empty file) must not be
+        // silently accepted — Report::success_rate() would vacuously read
+        // 100% with zero visible target ticks, a false pass.
+        let frames = vec![vec![0u8; 2 * 2 * 3]];
+        let gt = "0,1,0,0,1,1\n"; // track_id 1 (distractor) only, no target
+        let err = build_sequence("t", frames, 2, 2, gt).unwrap_err();
+        assert!(matches!(err, RealSeqError::TargetNeverVisible));
+    }
+
+    #[test]
+    fn build_sequence_last_write_wins_on_duplicate_rows() {
+        // Documented behaviour (see module docs): a duplicate (frame,
+        // track_id) row overwrites the earlier one rather than erroring.
+        let frames = vec![vec![0u8; 2 * 2 * 3]];
+        let gt = "0,0,0,0,1,1\n0,0,0,0,2,2\n";
+        let seq = build_sequence("t", frames, 2, 2, gt).unwrap();
+        assert_eq!(seq.target_gt[0].bbox, BBox::new(0, 0, 2, 2));
+    }
+
+    #[test]
+    fn load_image_sequence_rejects_empty_directory() {
+        let dir = unique_temp_dir();
+        let err = load_image_sequence(&dir).unwrap_err();
+        assert!(matches!(err, RealSeqError::EmptyFrameDir(_)));
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
