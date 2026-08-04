@@ -117,16 +117,70 @@ pub enum RealSeqError {
     FfmpegLaunch(std::io::Error),
 }
 
+/// The exact filename shape `extract_video_frames` writes and
+/// `clear_stale_extracted_frames` is therefore allowed to delete:
+/// `frame_` + 6 ASCII digits + `.png`. Kept as one predicate so the two
+/// functions can't drift apart.
+fn is_extracted_frame_filename(name: &str) -> bool {
+    name.strip_prefix("frame_")
+        .and_then(|rest| rest.strip_suffix(".png"))
+        .is_some_and(|digits| digits.len() == 6 && digits.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Remove only files this module itself would have written to `out_dir` on
+/// a previous run (`frame_NNNNNN.png`) — never anything else that happens
+/// to live there. `out_dir` is a caller-supplied path with no guarantee
+/// it's a scratch directory; naively `remove_dir_all`-ing it would delete
+/// arbitrary user data if `--frames` is pointed at, say, the video's own
+/// directory (confirmed live in round-2 review: pointing `--frames` at
+/// `assets/sample/` deleted `sample.mp4` and `ground_truth.csv` right out
+/// from under the extraction that was about to read them). Missing/absent
+/// `out_dir` is not an error here — `create_dir_all` right after handles
+/// that.
+fn clear_stale_extracted_frames(out_dir: &Path) -> Result<(), RealSeqError> {
+    let entries = match fs::read_dir(out_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(RealSeqError::Io {
+                path: out_dir.to_path_buf(),
+                source: e,
+            })
+        }
+    };
+    for entry in entries {
+        let entry = entry.map_err(|e| RealSeqError::Io {
+            path: out_dir.to_path_buf(),
+            source: e,
+        })?;
+        let is_stale_frame =
+            entry.file_name().to_str().is_some_and(is_extracted_frame_filename) && entry.file_type().map(|t| t.is_file()).unwrap_or(false);
+        if is_stale_frame {
+            fs::remove_file(entry.path()).map_err(|e| RealSeqError::Io {
+                path: entry.path(),
+                source: e,
+            })?;
+        }
+    }
+    Ok(())
+}
+
 /// Decode `video_path` to a numbered PNG sequence in `out_dir` via the
-/// system `ffmpeg` binary. `out_dir` is wiped first if it already exists —
+/// system `ffmpeg` binary. Any `frame_NNNNNN.png` files already in
+/// `out_dir` are removed first (see [`clear_stale_extracted_frames`]) —
 /// re-running extraction into a dir left over from a *different*, longer
 /// video would otherwise leave that video's trailing frames in place
 /// (`ffmpeg -y` only overwrites the filenames it writes this run), silently
 /// misaligning frame content against the ground-truth CSV's indices.
-/// Frames come out as `frame_000001.png`, `frame_000002.png`, ... — in
-/// source order, which is what [`load_image_sequence`] expects.
+/// Anything else in `out_dir` (including `out_dir` itself, if it's not
+/// empty for unrelated reasons) is left untouched — this function never
+/// wipes a directory wholesale, since a caller may legitimately point
+/// `--frames` at a directory that also holds the source video and/or the
+/// ground-truth CSV. Frames come out as `frame_000001.png`,
+/// `frame_000002.png`, ... — in source order, which is what
+/// [`load_image_sequence`] expects.
 pub fn extract_video_frames(video_path: &Path, out_dir: &Path) -> Result<(), RealSeqError> {
-    fs::remove_dir_all(out_dir).ok();
+    clear_stale_extracted_frames(out_dir)?;
     fs::create_dir_all(out_dir).map_err(|e| RealSeqError::Io {
         path: out_dir.to_path_buf(),
         source: e,
@@ -530,6 +584,54 @@ mod tests {
         let err = load_image_sequence(&dir).unwrap_err();
         assert!(matches!(err, RealSeqError::EmptyFrameDir(_)));
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn is_extracted_frame_filename_matches_only_our_own_naming() {
+        assert!(is_extracted_frame_filename("frame_000000.png"));
+        assert!(is_extracted_frame_filename("frame_123456.png"));
+        assert!(!is_extracted_frame_filename("sample.mp4"));
+        assert!(!is_extracted_frame_filename("ground_truth.csv"));
+        assert!(!is_extracted_frame_filename("README.md"));
+        assert!(!is_extracted_frame_filename("frame_00000.png")); // 5 digits
+        assert!(!is_extracted_frame_filename("frame_0000000.png")); // 7 digits
+        assert!(!is_extracted_frame_filename("frame_00000a.png")); // non-digit
+        assert!(!is_extracted_frame_filename("Frame_000000.png")); // case
+        assert!(!is_extracted_frame_filename("frame_000000.jpg")); // wrong ext
+    }
+
+    #[test]
+    fn clear_stale_extracted_frames_only_removes_its_own_files() {
+        // Regression test for a round-2-review-caught BLOCKER: a naive
+        // `remove_dir_all(out_dir)` deletes anything in that directory,
+        // including a source video and ground-truth CSV a caller
+        // legitimately keeps alongside the extraction target (this crate's
+        // own tracking-eval/assets/sample/ does exactly that). Only
+        // `frame_NNNNNN.png` files this module itself would have written
+        // may be removed.
+        let dir = unique_temp_dir();
+        fs::write(dir.join("frame_000000.png"), b"stale frame").unwrap();
+        fs::write(dir.join("frame_000001.png"), b"stale frame").unwrap();
+        fs::write(dir.join("sample.mp4"), b"not a real video, just data").unwrap();
+        fs::write(dir.join("ground_truth.csv"), b"0,0,0,0,1,1\n").unwrap();
+        fs::write(dir.join("README.md"), b"do not delete me").unwrap();
+
+        clear_stale_extracted_frames(&dir).unwrap();
+
+        assert!(!dir.join("frame_000000.png").exists(), "stale extracted frame should be removed");
+        assert!(!dir.join("frame_000001.png").exists(), "stale extracted frame should be removed");
+        assert!(dir.join("sample.mp4").exists(), "unrelated file must survive");
+        assert!(dir.join("ground_truth.csv").exists(), "unrelated file must survive");
+        assert!(dir.join("README.md").exists(), "unrelated file must survive");
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn clear_stale_extracted_frames_is_a_no_op_on_a_missing_directory() {
+        let dir = unique_temp_dir();
+        fs::remove_dir_all(&dir).unwrap(); // now genuinely absent
+        clear_stale_extracted_frames(&dir).unwrap(); // must not error
     }
 
     #[test]
