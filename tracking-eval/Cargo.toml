@@ -16,3 +16,10 @@ path = "src/lib.rs"
 
 [dependencies]
 tracking-core = { path = "../tracking-core" }
+thiserror = "2.0.19"
+# Pure-Rust image decode for the real-video eval path (real.rs) — no system
+# CV/codec libs needed for the image-sequence input mode, keeping this
+# crate's dependency footprint close to the synthetic-only baseline. Real
+# *video file* input additionally shells out to the system `ffmpeg` binary
+# (see real.rs's module docs) rather than linking a decoder here.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }

@@ -15,7 +15,7 @@ what a drone is.
 |---|---|---|
 | [`tracking-core`](tracking-core) | The algorithm: acquisition, seedability gating, association, the `Stage` state machine, and `TrackingSession` (the public entry point). Includes `SimpleTracker`, a dependency-free reference tracker backend. | none |
 | [`tracking-cv`](tracking-cv) | A production-grade `Tracker` backend wrapping OpenCV's `TrackerCSRT` (contrib). | libclang, libopencv (+contrib) |
-| [`tracking-eval`](tracking-eval) | Synthetic-data evaluation harness — generates known-ground-truth sequences and scores a tracking run against them. Ships the `eval` binary. | none |
+| [`tracking-eval`](tracking-eval) | Evaluation harness — synthetic known-ground-truth sequences (zero deps) plus a real-video mode (real frames + real ground-truth annotations). Ships the `eval` binary. | none for synthetic mode + image-sequence real mode; system `ffmpeg` only if feeding a real video *file* (`eval real --video`) |
 
 `tracking-core` has no dependency on `tracking-cv` or vice versa (`tracking-cv`
 depends on `tracking-core`, never the reverse) — a consumer who doesn't need
@@ -193,6 +193,47 @@ object identity, so a distractor that becomes more central than the real
 target for a tick or two *can* steal association — this is a known,
 documented trade-off in the original design (HWC-43 in the source
 provenance), not something this extraction introduced or hid.
+
+## Real-video eval mode
+
+`eval`'s synthetic scenarios above never touch a decoded frame — good for a
+fast, zero-dependency regression gate, but it doesn't answer "how does this
+do against an actual clip." `tracking-eval::real` (see that module's docs)
+adds a second mode that does:
+
+```
+cargo run -p tracking-eval --bin eval -- real --frames <image-seq-dir> [--gt <file>] [--video <file>]
+# or: make eval-real   # runs it against the checked-in sample clip
+```
+
+- `--frames <dir>`: an image-sequence directory (PNG/JPEG, sorted by
+  filename, constant resolution) — the baseline real-frame input, no system
+  deps beyond the pure-Rust `image` crate.
+- `--video <file>`: a real video file, decoded to that same image-sequence
+  shape via the system `ffmpeg` binary first (this crate does not link a
+  video decoder itself — see `real.rs`'s module docs for why).
+- `--gt <file>`: ground truth CSV, `frame,track_id,x1,y1,x2,y2` per line
+  (`track_id 0` = target, `1` = optional distractor for the ID-switch
+  metric). Defaults to `<frames>/ground_truth.csv`.
+
+Detections fed to `TrackingSession::step` are the target's own ground-truth
+boxes, confidence 1.0 — a stand-in "perfect detector." This isolates the
+**tracking** algorithm (acquisition/association/lock-loss) from detector
+quality; it is not an end-to-end detector+tracker evaluation. Swapping in a
+real detector's output (e.g. `autonomous-videography-perception`'s) needs
+only a different per-tick `Detection` list — the frame-loading and scoring
+code doesn't care where detections came from.
+
+Scoring is the *exact same* `metrics::score` used for synthetic scenarios —
+success rate, mean IoU, time-to-lock, reacquisition ticks, ID switches — so
+real-clip numbers are directly comparable to the synthetic baseline above.
+
+`tracking-eval/assets/sample/` ships a small (60-frame, ~100KB) checked-in
+clip so `make eval-real` works out of the box. Its content is procedurally
+generated (a moving box on a textured background, exact known trajectory),
+**not** real-world camera footage — see that directory's README for exactly
+what it does and doesn't verify. Point `--frames`/`--video`/`--gt` at a real
+clip of your own for a genuine real-world check.
 
 ## Consuming this crate from a host pipeline
 

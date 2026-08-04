@@ -1,9 +1,15 @@
 //! Synthetic frame-sequence generation with known ground truth. No real
-//! video/images involved — each frame is a flat background with one or two
-//! flat-colour axis-aligned squares rendered directly into an RGB8 buffer.
-//! That's enough texture for both [`tracking_core::SimpleTracker`]'s SAD
-//! template matcher and a real correlation filter to lock onto, while
+//! video/images involved here — each frame is a flat background with one or
+//! two flat-colour axis-aligned squares rendered directly into an RGB8
+//! buffer. That's enough texture for both [`tracking_core::SimpleTracker`]'s
+//! SAD template matcher and a real correlation filter to lock onto, while
 //! keeping generation trivial and fully deterministic.
+//!
+//! For a real-video/real-image-sequence eval path (real frames plus
+//! ground-truth annotations, run through `TrackingSession::step` for real),
+//! see [`crate::real`]. This module stays synthetic-only on purpose — it's
+//! the fast, zero-dependency regression gate; `real` is the objective
+//! sample-footage check the founding brief asks for.
 
 use crate::rng::Rng;
 use tracking_core::{BBox, Detection, FrameView};
@@ -25,8 +31,14 @@ pub struct GroundTruth {
 /// A generated sequence: ground truth for the target (and, in the
 /// distractor scenario, a second decoy object) plus per-tick rendered
 /// frames and detector output.
+#[derive(Debug)]
 pub struct Sequence {
     pub name: &'static str,
+    /// Frame dimensions. Synthetic sequences are always [`WIDTH`]x[`HEIGHT`];
+    /// real-video sequences (see [`crate::real`]) carry whatever the source
+    /// frames actually are.
+    pub width: u32,
+    pub height: u32,
     pub frames: Vec<Vec<u8>>,
     pub target_gt: Vec<GroundTruth>,
     pub distractor_gt: Vec<Option<GroundTruth>>,
@@ -42,8 +54,8 @@ impl Sequence {
     pub fn frame_view(&self, tick: usize) -> FrameView<'_> {
         FrameView {
             pixels: &self.frames[tick],
-            width: WIDTH,
-            height: HEIGHT,
+            width: self.width,
+            height: self.height,
             channels: 3,
         }
     }
@@ -225,6 +237,8 @@ fn build(
 
     Sequence {
         name,
+        width: WIDTH,
+        height: HEIGHT,
         frames,
         target_gt,
         distractor_gt,
