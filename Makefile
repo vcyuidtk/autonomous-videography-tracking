@@ -29,7 +29,13 @@ fmt-check:  ## cargo fmt --all --check
 eval:  ## Run the synthetic-data evaluation harness (tracking-eval)
 	cargo run -p tracking-eval --bin eval
 
+eval-real:  ## Run tracking-eval's real-video mode against the checked-in sample clip (needs `ffmpeg` on PATH)
+	cargo run -p tracking-eval --bin eval -- real \
+		--video tracking-eval/assets/sample/sample.mp4 \
+		--frames target/eval-real-frames \
+		--gt tracking-eval/assets/sample/ground_truth.csv
+
 clean:  ## cargo clean
 	cargo clean
 
-.PHONY: help build test clippy fmt fmt-check eval clean
+.PHONY: help build test clippy fmt fmt-check eval eval-real clean
