@@ -5,6 +5,13 @@
 # (+ contrib) dev packages on the host — see README "Building tracking-cv"
 # if `build`/`test` fails only on that crate.
 
+# Optional ./.env (KEY=VALUE lines), exported to every recipe; command-line
+# assignments still win over it.
+ifneq (,$(wildcard ./.env))
+  include .env
+  export
+endif
+
 .DEFAULT_GOAL := help
 
 help:  ## Show this help
