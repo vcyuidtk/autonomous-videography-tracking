@@ -71,6 +71,11 @@ pub struct Stage<T: Tracker> {
     // Idle, so a Lost tick always carries a real last-known box.
     held: Option<HeldTrack>,
     prev_state: StateTag,
+
+    // Whether the age-out branch fired on the most recent `tick` — this
+    // crate is I/O-free (see module docs), so the caller reads this to log
+    // the trip rather than `tick` logging it itself.
+    last_age_out: bool,
 }
 
 impl<T: Tracker> Stage<T> {
@@ -86,11 +91,17 @@ impl<T: Tracker> Stage<T> {
             last_refresh_s: 0.0,
             held: None,
             prev_state: StateTag::Idle,
+            last_age_out: false,
         }
     }
 
     pub fn tracker(&self) -> &T {
         &self.tracker
+    }
+
+    /// Whether [`Self::tick`]'s age-out guard fired on the most recent call.
+    pub fn last_tick_aged_out(&self) -> bool {
+        self.last_age_out
     }
 
     /// Step 1: fold in one detector batch. With nothing locked: class-
@@ -140,6 +151,7 @@ impl<T: Tracker> Stage<T> {
     /// [`TrackState`]. `force_reinit` is `true` only when `pending` came
     /// from [`Self::on_force_lock`].
     pub fn tick(&mut self, frame: FrameView<'_>, now_s: f64, pending: Option<PendingLock>, force_reinit: bool) -> TrackState {
+        self.last_age_out = false;
         // 1c: tracker-capability gate — a nomination the backend cannot
         // physically seed is dropped here, not discovered as a crash inside
         // reinit.
@@ -209,6 +221,7 @@ impl<T: Tracker> Stage<T> {
 
         // 3. Age out if stale.
         if self.tracker.is_active() && crate::is_stale(self.last_refresh_s, now_s, self.config.max_age_s) {
+            self.last_age_out = true;
             self.tracker.reset();
             self.reset_lock_state();
             box_out = None;
@@ -365,11 +378,13 @@ mod tests {
             panic!("expected Locked")
         };
 
+        assert!(!s.last_tick_aged_out(), "no age-out on a healthy lock");
         let state = s.tick(frame(), 100.0, None, false);
         match state {
             TrackState::Lost(h) => assert_eq!(h.bbox, held.bbox),
             other => panic!("expected Lost carrying the held box, got {other:?}"),
         }
+        assert!(s.last_tick_aged_out(), "the age-out branch fired this tick");
     }
 
     #[test]
